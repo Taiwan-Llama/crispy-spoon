@@ -64,7 +64,7 @@ class DocumentManager:
             # 生成向量
             query_embedding = self.embedding_model.get_query_embedding(query)
         
-            # 使用嵌入进行相似性搜索
+            # 使用嵌入進行相似性搜索
             retriever = self.index.as_retriever(similarity_top_k=top_k)
             results = retriever.retrieve(query_embedding=query_embedding)  # 关键修复
         
@@ -263,16 +263,6 @@ class MCPClient:
                 "-y",
                 "@modelcontextprotocol/server-sequential-thinking"
                     ]
-        },
-        "filesystem": {
-            "command": "C:/Program Files/nodejs/npx.cmd",
-            "args": [
-                "-y",
-                "@modelcontextprotocol/server-filesystem",
-                    "C:\\Users\\your\\Downloads",
-                    "C:\\Users\\your\\Documents",
-                    "C:\\Users\\your\\Desktop"
-                ]
         }
         }
         
