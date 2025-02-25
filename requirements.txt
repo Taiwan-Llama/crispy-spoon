@@ -1,0 +1,10 @@
+asyncio
+python-dotenv
+discord.py
+ujson
+openai
+llama-index
+chromadb
+numpy
+pathlib
+mcp
