@@ -24,7 +24,7 @@ if not DISCORD_TOKEN:
     raise ValueError("Please set DISCORD_TOKEN in .env file")
 
 class DocumentManager:
-    def __init__(self, embedding_model="mistral-small3:Q6_K_L", base_url="http://localhost:11434"):
+    def __init__(self, embedding_model="miscii-14b-0218_q8:latest", base_url="http://localhost:11434"):
         self.embedding_model = OllamaEmbedding(
             model_name=embedding_model,
             base_url=base_url,
@@ -96,22 +96,29 @@ class ChromaMemoryManager:
             name=collection_name,
             embedding_function=embedding_function
         )
-        # Remove in-memory turn_counters
 
     async def store_memory(self, user_id: str, content: str, metadata: dict):
         try:
-            # 取得現有對話回合數
             existing = self.collection.get(
                 where={"user_id": str(user_id)},
                 include=["metadatas"]
             )
             max_turn = -1
             for meta in existing.get('metadatas', []):
-                try:
-                    turn = int(meta.get('turn_number', -1))
-                    max_turn = max(max_turn, turn)
-                except (ValueError, TypeError):
-                    continue
+                # 如果是巢狀結構，平坦化處理
+                if isinstance(meta, list):
+                    for m in meta:
+                        try:
+                            turn = int(m.get('turn_number', -1))
+                            max_turn = max(max_turn, turn)
+                        except (ValueError, TypeError):
+                            continue
+                else:
+                    try:
+                        turn = int(meta.get('turn_number', -1))
+                        max_turn = max(max_turn, turn)
+                    except (ValueError, TypeError):
+                        continue
             turn_number = max_turn + 1
 
             current_time = datetime.now()
@@ -121,7 +128,6 @@ class ChromaMemoryManager:
                 "timestamp": current_time.isoformat(),
                 "date": current_time.date().isoformat(),
                 "turn_number": str(turn_number),
-                # 若 metadata 中 username 為 None 則改用 user_id
                 "username": str(metadata.get("username") or user_id),
             }
             
@@ -135,15 +141,44 @@ class ChromaMemoryManager:
             print(f"Error storing memory: {str(e)}")
             return False
 
+    async def retrieve_all_memories(self, user_id: str) -> List[Tuple[str, float, dict]]:
+        """
+        直接取出該用戶所有對話記憶，並依 turn_number 排序。
+        這裡先將可能的巢狀清單平坦化，再組合成完整記憶。
+        """
+        try:
+            where = {"user_id": str(user_id)}
+            all_data = self.collection.get(where=where, include=["metadatas", "documents"])
+            memories = []
+            if all_data and "documents" in all_data and all_data["documents"]:
+                docs = []
+                metas = []
+                # 平坦化 documents 與 metadatas
+                for item in all_data["documents"]:
+                    if isinstance(item, list):
+                        docs.extend(item)
+                    else:
+                        docs.append(item)
+                for item in all_data["metadatas"]:
+                    if isinstance(item, list):
+                        metas.extend(item)
+                    else:
+                        metas.append(item)
+                for doc, meta in zip(docs, metas):
+                    memories.append((doc, 0.0, meta))
+                memories.sort(key=lambda x: int(x[2].get("turn_number", 0)))
+            return memories
+        except Exception as e:
+            print(f"Error retrieving all memories: {str(e)}")
+            return []
+
     async def retrieve_memories(self, query: str, user_id: str = None, top_k: int = 5) -> List[Tuple[str, float, dict]]:
         try:
             where = {"user_id": user_id} if user_id else None
-
-            # 先取得符合條件的記憶數量，避免請求超出範圍
-            try:
-                count = self.collection.count(where=where)
-            except Exception:
-                count = top_k
+            
+            # 取得該用戶目前存有的記憶筆數
+            count = self.collection.count(where=where)
+            print(f"User {user_id} has {count} stored memories")
             if count < top_k:
                 top_k = count
 
@@ -165,6 +200,7 @@ class ChromaMemoryManager:
             ):
                 memories.append((doc, dist, meta))
             
+            # 依照 turn_number 進行排序
             memories.sort(key=lambda x: int(x[2].get('turn_number', 0)))
             return memories
             
@@ -179,16 +215,16 @@ class ConversationLogger:
         self.conversations: Dict[str, List[Dict]] = {}
         self.memory_manager = ChromaMemoryManager(
             embedding_model=OllamaEmbedding(
-                model_name="mistral-small3:Q6_K_L",
+                model_name="miscii-14b-0218_q8:latest",
                 base_url="http://localhost:11434"
             )
         )
     
-    def add_message(self, user_id: str, role: str, content: str, username: str = None):
-        # 若 username 為 None，則設為 user_id（discord userID）
-        username = username if username is not None else user_id
+    async def add_message(self, user_id: str, role: str, content: str, username: str = None):
         if user_id not in self.conversations:
             self.conversations[user_id] = []
+        # 若 username 為 None，則預設使用 user_id
+        username = username if username is not None else user_id
         
         message_data = {
             "from": role,
@@ -198,18 +234,14 @@ class ConversationLogger:
         }
         self.conversations[user_id].append(message_data)
         
-        # 儲存記憶時強制使用 discord userID 作為 username
         metadata = {
             "user_id": user_id,
             "role": role,
             "username": username,
             "timestamp": datetime.now().isoformat()
         }
-        asyncio.create_task(
-            self.memory_manager.store_memory(user_id, content, metadata)
-        )
+        await self.memory_manager.store_memory(user_id, content, metadata)
 
-    
     def save_conversation(self, user_id: str):
         if user_id not in self.conversations:
             return
@@ -242,7 +274,7 @@ class MCPClient:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
-        self.bot = commands.Bot(command_prefix="!", intents=intents)
+        self.bot = commands.Bot(command_prefix="/", intents=intents)
         
         # Define MCP servers configuration
         self.mcp_servers = {
@@ -357,34 +389,31 @@ class MCPClient:
                     return
 
                 async with message.channel.typing():
-                    # Get relevant document context
+                    # 取得相關文件內容
                     doc_results = await self.doc_manager.query_documents(message.content)
                     context = "\n".join([f"Related content:\n{text}" for text, _ in doc_results])
-                    
-                    # Get user display name and mention string
                     user_display_name = message.author.display_name
                     user_mention = message.author.mention
-                    
-                    # Log user message with username
-                    self.logger.add_message(
+            
+                    # 記錄使用者訊息 (await 改為同步等待)
+                    await self.logger.add_message(
                         str(message.author.id),
                         "human",
                         message.content,
-                        user_display_name
-                    )
-                    
-                    # Enhance the query with document context
+                        message.author.display_name
+                                )
+
+            
                     enhanced_query = f"{message.content}\n\nContext from related documents:\n{context}" if context else message.content
-                    
-                    # Get response using all available servers
+            
                     response = await self.process_query_all_servers(
                         enhanced_query,
                         user_display_name,
                         user_mention
                     )
-                    
-                    # Log assistant response
-                    self.logger.add_message(
+            
+                # 記錄助理回應
+                    await self.logger.add_message(
                         str(message.author.id),
                         "assistant",
                         response
@@ -407,30 +436,18 @@ class MCPClient:
 
     # 修改消息處理邏輯
     async def process_query_all_servers(self, query: str, user_display_name: str, user_mention: str) -> str:
-        """Process a query using all available tools from all servers"""
-        if not self.sessions:
-            return "Error: No MCP sessions initialized"
+        # 取得完整對話記憶（所有輪次）
+        user_id = str(self.current_message.author.id) if self.current_message else None
+        memory_results = await self.logger.memory_manager.retrieve_all_memories(user_id)
+        memory_context = "\n".join([
+            f"- 歷史對話 [輪次: {meta.get('turn_number', '?')}, 時間: {meta.get('timestamp', '?')}]：{text[:100]}..." 
+            for text, _, meta in memory_results
+        ])
 
-        try:
-            # Get user_id from the current message context
-            user_id = str(self.current_message.author.id) if self.current_message else None
-            
-            # Retrieve memories with the correct user_id
-            memory_results = await self.logger.memory_manager.retrieve_memories(
-                query=query,
-                user_id=user_id,
-                top_k=3
-            )
-            memory_context = "\n".join([
-                f"- 歷史對話 [輪數: {meta.get('turn_number', '?')}, 時間: {meta.get('timestamp', '?')}] "
-                f"(相關性 {score:.2f})：{text[:100]}..." 
-                for text, score, meta in memory_results
-                ])
-            
-            messages = [
-                {
-                    "role": "system",
-                    "content": f"""
+        messages = [
+            {
+                "role": "system",
+                "content": f"""
 <|context_start|>personas<|context_sep|>
 <|personas_start|>user<|persona_sep|>
 I am {user_display_name}. 你可以用 {user_mention} 來@我.
@@ -444,38 +461,27 @@ I am Nalolo. 我有自己的主見和三觀.
 2. 用戶需要特別注意某個重要訊息
 3. 回應用戶的感謝或稱讚
 4. 討論較為嚴肅或重要的話題
-其他普通對話中,我會直接用{user_display_name}稱呼使用者。 .
+其他普通對話中,我會直接用{user_display_name}稱呼使用者.
 <|personas_end|>
 <|Tool_start|>Tool<|Tool_sep|>
 **Tool Instructions (Separated for Combination):**
-
-* **puppeteer:**
-   - Instruction: "When the user asks a question that requires browsing the web or interacting with a website to find an answer, use the `puppeteer` tool to access and retrieve information from the web.  For example, if the user asks about current events, product information, or needs data from a specific website, use `puppeteer` to browse and get the relevant content. Ensure to clearly state when you are using `puppeteer` to get information."
-
-* **memory:**
-   - Instruction: "Utilize the `memory` tool to store and recall information from past conversations. Remember user preferences, important details shared by the user, and context from previous turns in the conversation. Use this memory to personalize interactions, provide relevant follow-up responses, and avoid repeating questions or information already discussed. When accessing or updating memory, explicitly mention that you are using the `memory` tool."
-
-* **duckduckgo-search-server:**
-   - Instruction: "If the user's query requires general knowledge or information retrieval from the internet, and `puppeteer` is not specifically needed for website interaction, use the `duckduckgo-search-server` tool to perform a web search. This is useful for answering factual questions, getting definitions, or finding general information.  Summarize the search results concisely and inform the user that you used `duckduckgo-search-server` for the information."
-* **sequential-thinking:**
-   - Instruction: "Employ `sequential-thinking` to break down complex user requests or questions into smaller, manageable steps. Plan your responses logically, especially for multi-turn conversations or when addressing multifaceted queries.  Think step-by-step to ensure a coherent and well-structured interaction. For example, if a user asks for help with a multi-stage task, use sequential thinking to address each stage systematically."
-
+...
 <|Tool_end|>
 <|memory_start|>
 {memory_context}
 <|memory_end|>
 <|context_end|>
 """
-                },
-                {
-                    "role": "user",
-                    "content": query
-                }
+            },
+            {
+                "role": "user",
+                "content": query
+            }
             ]
 
             # Get tools from all servers
-            all_tools = []
-            for server_name, session in self.sessions.items():
+        all_tools = []
+        for server_name, session in self.sessions.items():
                 try:
                     response = await session.list_tools()
                     server_tools = response.tools
@@ -496,19 +502,19 @@ I am Nalolo. 我有自己的主見和三觀.
                 except Exception as e:
                     print(f"Error fetching tools from {server_name}: {str(e)}")
 
+        try:
+            # 呼叫 openai API 的邏輯...
             completion = await self.openai.chat.completions.create(
                 model="mistral-small3:Q6_K_L",
                 messages=messages,
                 temperature=0.70,
                 top_p=0.80,
                 max_tokens=4096,
-                extra_body=dict(repetition_penalty=1.05, top_k=40),
-                tools=all_tools
+                extra_body=dict(repetition_penalty=1.05, top_k=40)
             )
             completion = completion.choices[0].message
 
             final_text = []
-            
             if completion.content:
                 final_text.append(completion.content)
 
@@ -517,20 +523,16 @@ I am Nalolo. 我有自己的主見和三觀.
                     tool_parts = tool_call.function.name.split(":", 1)
                     if len(tool_parts) != 2:
                         continue
-                        
                     server_name, tool_name = tool_parts
                     tool_args = json.loads(tool_call.function.arguments)
-                    
                     if server_name in self.sessions:
                         session = self.sessions[server_name]
                         result = await session.call_tool(tool_name, tool_args)
                         final_text.append(f"[Using {server_name} tool {tool_name}]")
-                        
                         messages.extend([
                             {"role": "assistant", "content": completion.content} if completion.content else None,
                             {"role": "tool", "name": f"{server_name}:{tool_name}", "content": result.content}
                         ])
-
                 final_response = await self.openai.chat.completions.create(
                     model="mistral-small3:Q6_K_L",
                     messages=[msg for msg in messages if msg],
@@ -542,7 +544,6 @@ I am Nalolo. 我有自己的主見和三觀.
                 final_text.append(final_response.choices[0].message.content)
 
             return "\n".join(filter(None, final_text))
-
         except Exception as e:
             return f"Error processing query: {str(e)}"
 
