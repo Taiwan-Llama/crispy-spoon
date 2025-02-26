@@ -247,7 +247,7 @@ class MCPClient:
         # Define MCP servers configuration
         self.mcp_servers = {
         "puppeteer": {
-            "command": "C:/Program Files/nodejs/npx.cmd",
+            "command": "npx",
             "args": [
                 "-y",
                 "@modelcontextprotocol/server-puppeteer"
@@ -256,12 +256,12 @@ class MCPClient:
         "duckduckgo-search-server": {
             "command": "node",
             "args": [
-            "C:/Users/jmes1/Documents/Cline/MCP/duckduckgo-search-server/build/index.js"
+            "./MCP/duckduckgo-search-server/build/index.js"
             ],
             "alwaysAllow": []
         },
         "sequential-thinking": {
-            "command": "C:/Program Files/nodejs/npx.cmd",
+            "command": "npx",
             "args": [
                 "-y",
                 "@modelcontextprotocol/server-sequential-thinking"
