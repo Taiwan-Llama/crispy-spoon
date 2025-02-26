@@ -1,7 +1,7 @@
 import asyncio
 import os
 from contextlib import AsyncExitStack
-from typing import Optional, Dict, List, Tuple
+from typing import Dict, List, Tuple
 from datetime import datetime
 import discord
 from discord.ext import commands
@@ -14,9 +14,8 @@ from openai import AsyncOpenAI
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core import Document, VectorStoreIndex, Settings
 import chromadb
-from chromadb.config import Settings as ChromaSettings
-import numpy as np
-from pathlib import Path
+from chromadb.config import Settings
+
 
 load_dotenv()
 
@@ -64,7 +63,7 @@ class DocumentManager:
             # 生成向量
             query_embedding = self.embedding_model.get_query_embedding(query)
         
-            # 使用嵌入進行相似性搜索
+            # 使用嵌入进行相似性搜索
             retriever = self.index.as_retriever(similarity_top_k=top_k)
             results = retriever.retrieve(query_embedding=query_embedding)  # 关键修复
         
@@ -97,26 +96,33 @@ class ChromaMemoryManager:
             name=collection_name,
             embedding_function=embedding_function
         )
-        self.turn_counters = {}  # Track conversation turns per user
-
-    def _get_and_increment_turn(self, user_id: str) -> int:
-        """Get and increment the turn counter for a user"""
-        current_turn = self.turn_counters.get(user_id, 0)
-        self.turn_counters[user_id] = current_turn + 1
-        return current_turn
+        # Remove in-memory turn_counters
 
     async def store_memory(self, user_id: str, content: str, metadata: dict):
         try:
-            turn_number = self._get_and_increment_turn(user_id)
+            # 取得現有對話回合數
+            existing = self.collection.get(
+                where={"user_id": str(user_id)},
+                include=["metadatas"]
+            )
+            max_turn = -1
+            for meta in existing.get('metadatas', []):
+                try:
+                    turn = int(meta.get('turn_number', -1))
+                    max_turn = max(max_turn, turn)
+                except (ValueError, TypeError):
+                    continue
+            turn_number = max_turn + 1
+
             current_time = datetime.now()
-            
             cleaned_metadata = {
                 "user_id": str(user_id),
                 "role": metadata.get("role", ""),
                 "timestamp": current_time.isoformat(),
                 "date": current_time.date().isoformat(),
                 "turn_number": str(turn_number),
-                "username": metadata.get("username", ""),
+                # 若 metadata 中 username 為 None 則改用 user_id
+                "username": str(metadata.get("username") or user_id),
             }
             
             self.collection.add(
@@ -132,17 +138,25 @@ class ChromaMemoryManager:
     async def retrieve_memories(self, query: str, user_id: str = None, top_k: int = 5) -> List[Tuple[str, float, dict]]:
         try:
             where = {"user_id": user_id} if user_id else None
+
+            # 先取得符合條件的記憶數量，避免請求超出範圍
+            try:
+                count = self.collection.count(where=where)
+            except Exception:
+                count = top_k
+            if count < top_k:
+                top_k = count
+
             results = self.collection.query(
                 query_texts=[query],
                 n_results=top_k,
                 where=where,
-                include=["metadatas"]
+                include=["metadatas", "documents", "distances"]
             )
             
             if not results['documents'] or not results['documents'][0]:
                 return []
                 
-            # Return documents with their metadata and distances
             memories = []
             for doc, meta, dist in zip(
                 results['documents'][0],
@@ -151,7 +165,6 @@ class ChromaMemoryManager:
             ):
                 memories.append((doc, dist, meta))
             
-            # Sort by turn number to maintain conversation flow
             memories.sort(key=lambda x: int(x[2].get('turn_number', 0)))
             return memories
             
@@ -164,7 +177,6 @@ class ConversationLogger:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
         self.conversations: Dict[str, List[Dict]] = {}
-        # 新增Chroma
         self.memory_manager = ChromaMemoryManager(
             embedding_model=OllamaEmbedding(
                 model_name="mistral-small3:Q6_K_L",
@@ -173,20 +185,20 @@ class ConversationLogger:
         )
     
     def add_message(self, user_id: str, role: str, content: str, username: str = None):
+        # 若 username 為 None，則設為 user_id（discord userID）
+        username = username if username is not None else user_id
         if user_id not in self.conversations:
             self.conversations[user_id] = []
         
         message_data = {
             "from": role,
             "value": content,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "username": username
         }
-        if username:
-            message_data["username"] = username
-            
         self.conversations[user_id].append(message_data)
         
-        # 新增：消息save到ChromaDB
+        # 儲存記憶時強制使用 discord userID 作為 username
         metadata = {
             "user_id": user_id,
             "role": role,
@@ -241,19 +253,10 @@ class MCPClient:
                 "@modelcontextprotocol/server-puppeteer"
             ]
         },
-        "memory": {
-            "command": "node",
-            "args": [
-            "C:\\Users\\YourUsername\\AppData\\Roaming\\npm\\node_modules\\@modelcontextprotocol\\server-memory\\dist\\index.js"
-                    ],
-            "env": {
-                "DEBUG": "*"
-                    }
-        },
         "duckduckgo-search-server": {
             "command": "node",
             "args": [
-            "./bot/MCP/duckduckgo-search-server/build/index.js"
+            "C:/Users/jmes1/Documents/Cline/MCP/duckduckgo-search-server/build/index.js"
             ],
             "alwaysAllow": []
         },
@@ -263,7 +266,7 @@ class MCPClient:
                 "-y",
                 "@modelcontextprotocol/server-sequential-thinking"
                     ]
-        }
+            }
         }
         
         # Register commands and events
