@@ -4,6 +4,7 @@ from contextlib import AsyncExitStack
 from typing import Dict, List, Tuple
 from datetime import datetime
 import discord
+from discord import app_commands
 from discord.ext import commands
 import ujson as json
 from dotenv import load_dotenv
@@ -274,12 +275,12 @@ class MCPClient:
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
-        self.bot = commands.Bot(command_prefix="/", intents=intents)
+        self.bot = commands.Bot(command_prefix="!", intents=intents)
         
         # Define MCP servers configuration
         self.mcp_servers = {
         "puppeteer": {
-            "command": "npx",
+            "command": "C:/Program Files/nodejs/npx.cmd",
             "args": [
                 "-y",
                 "@modelcontextprotocol/server-puppeteer"
@@ -288,12 +289,12 @@ class MCPClient:
         "duckduckgo-search-server": {
             "command": "node",
             "args": [
-            "./MCP/duckduckgo-search-server/build/index.js"
+            "C:/Users/jmes1/Documents/Cline/MCP/duckduckgo-search-server/build/index.js"
             ],
             "alwaysAllow": []
         },
         "sequential-thinking": {
-            "command": "npx",
+            "command": "C:/Program Files/nodejs/npx.cmd",
             "args": [
                 "-y",
                 "@modelcontextprotocol/server-sequential-thinking"
@@ -306,32 +307,35 @@ class MCPClient:
         self.register_events()
 
     def register_commands(self):
-        @self.bot.command(name="save")
-        async def save_chat(ctx):
+        @self.bot.tree.command(name="save", description="Save the current conversation history")
+        async def save_chat(interaction: discord.Interaction):
             """Save the current conversation history"""
             try:
-                self.logger.save_conversation(str(ctx.author.id))
-                await ctx.send("Conversation saved successfully!")
+                self.logger.save_conversation(str(interaction.user.id))
+                await interaction.response.send_message("Conversation saved successfully!")
             except Exception as e:
-                await ctx.send(f"Failed to save conversation: {str(e)}")
+                await interaction.response.send_message(f"Failed to save conversation: {str(e)}")
 
-        @self.bot.command(name="query")
-        async def query_docs(ctx, *, query: str):
+        @self.bot.tree.command(name="query", description="Query the document store for relevant information")
+        @app_commands.describe(query="The search query to find relevant documents")
+        async def query_docs(interaction: discord.Interaction, query: str):
             """Query the document store for relevant information"""
+            await interaction.response.defer()
             results = await self.doc_manager.query_documents(query)
             if not results:
-                await ctx.send("No relevant documents found.")
+                await interaction.followup.send("No relevant documents found.")
                 return
                 
             response = "Found relevant information:\n\n"
             for text, score in results:
                 response += f"Relevance score: {score:.2f}\n```\n{text[:500]}...\n```\n"
             
-            await ctx.send(response)
+            await interaction.followup.send(response)
 
-        @self.bot.command(name="servers")
-        async def list_servers(ctx):
+        @self.bot.tree.command(name="servers", description="List all available MCP servers and their status")
+        async def list_servers(interaction: discord.Interaction):
             """List all available MCP servers and their status"""
+            await interaction.response.defer()
             status = []
             for server_name, session in self.sessions.items():
                 tools = []
@@ -344,7 +348,7 @@ class MCPClient:
                 status.append(f"- {server_name}: {'Connected' if session else 'Disconnected'}\n  Tools: {', '.join(tools)}")
             
             status_message = "MCP Servers Status:\n" + "\n".join(status)
-            await ctx.send(status_message)
+            await interaction.followup.send(status_message)
 
     def register_events(self):
         @self.bot.event
@@ -354,6 +358,13 @@ class MCPClient:
             for guild in self.bot.guilds:
                 print(f"- {guild.name} (id: {guild.id})")
             
+            # Sync commands with Discord
+            try:
+                synced = await self.bot.tree.sync()
+                print(f"Synced {len(synced)} command(s)")
+            except Exception as e:
+                print(f"Failed to sync commands: {e}")
+                
             permissions = discord.Permissions(
                 send_messages=True,
                 read_messages=True,
@@ -386,6 +397,10 @@ class MCPClient:
                 # Process commands if message starts with prefix
                 if message.content.startswith(self.bot.command_prefix):
                     await self.bot.process_commands(message)
+                    return
+                    
+                # Skip messages that look like slash commands
+                if message.content.startswith('/'):
                     return
 
                 async with message.channel.typing():
@@ -505,12 +520,12 @@ I am Nalolo. 我有自己的主見和三觀.
         try:
             # 呼叫 openai API 的邏輯...
             completion = await self.openai.chat.completions.create(
-                model="mistral-small3:Q6_K_L",
+                model="miscii-14b-0218_q8:latest",
                 messages=messages,
-                temperature=0.70,
-                top_p=0.80,
-                max_tokens=4096,
-                extra_body=dict(repetition_penalty=1.05, top_k=40)
+                temperature=0,
+                top_p=1,
+                max_tokens=8196,
+                extra_body=dict(repetition_penalty=1.05, top_k=-1, num_beams=100)
             )
             completion = completion.choices[0].message
 
@@ -534,12 +549,12 @@ I am Nalolo. 我有自己的主見和三觀.
                             {"role": "tool", "name": f"{server_name}:{tool_name}", "content": result.content}
                         ])
                 final_response = await self.openai.chat.completions.create(
-                    model="mistral-small3:Q6_K_L",
+                    model="miscii-14b-0218_q8:latest",
                     messages=[msg for msg in messages if msg],
-                    temperature=0.70,
-                    top_p=0.80,
+                    temperature=0,
+                    top_p=1,
                     max_tokens=8196,
-                    extra_body=dict(repetition_penalty=1.05, top_k=40)
+                    extra_body=dict(repetition_penalty=1.05, top_k=-1, num_beams=100)
                 )
                 final_text.append(final_response.choices[0].message.content)
 
@@ -547,7 +562,65 @@ I am Nalolo. 我有自己的主見和三觀.
         except Exception as e:
             return f"Error processing query: {str(e)}"
 
-    # Rest of the MCPClient class implementation remains the same
+    # Add new slash commands for common functions
+    async def setup_additional_commands(self):
+        # Command group for document management
+        doc_group = app_commands.Group(name="doc", description="Document management commands")
+        
+        @doc_group.command(name="list", description="List all stored documents")
+        async def doc_list(interaction: discord.Interaction):
+            if not self.doc_manager.document_store:
+                await interaction.response.send_message("No documents have been indexed yet.")
+                return
+                
+            docs = "\n".join([f"- {doc_id}" for doc_id in self.doc_manager.document_store.keys()])
+            await interaction.response.send_message(f"Indexed documents:\n{docs}")
+        
+        @doc_group.command(name="clear", description="Clear all stored documents")
+        async def doc_clear(interaction: discord.Interaction):
+            self.doc_manager.document_store = {}
+            self.doc_manager.index = None
+            await interaction.response.send_message("Document store has been cleared.")
+            
+        # Command group for conversation management
+        conv_group = app_commands.Group(name="conv", description="Conversation management commands")
+        
+        @conv_group.command(name="clear", description="Clear your conversation history")
+        async def conv_clear(interaction: discord.Interaction):
+            user_id = str(interaction.user.id)
+            if user_id in self.logger.conversations:
+                self.logger.conversations[user_id] = []
+                await interaction.response.send_message("Your conversation history has been cleared.")
+            else:
+                await interaction.response.send_message("No conversation history found.")
+        
+        # Add the command groups to the bot
+        self.bot.tree.add_command(doc_group)
+        self.bot.tree.add_command(conv_group)
+        
+        # Individual utility commands
+        @self.bot.tree.command(name="help", description="Display information about available commands")
+        async def help_command(interaction: discord.Interaction):
+            help_text = """
+**Available Commands**
+
+**/save** - Save the current conversation history
+**/query [text]** - Search documents for information
+**/servers** - Show MCP server status and available tools
+
+**Document Management**
+**/doc list** - List all indexed documents
+**/doc clear** - Clear all document storage
+
+**Conversation Management**
+**/conv clear** - Clear your conversation history
+
+**Other**
+You can also upload files (.txt, .py, .md, .json) to have them indexed
+and talk directly to the bot without any commands
+            """
+            await interaction.response.send_message(help_text)
+
     async def connect_to_server(self, server_name: str) -> bool:
         """Connect to a specific MCP server with retry logic"""
         max_retries = 3
@@ -605,6 +678,9 @@ I am Nalolo. 我有自己的主見和三觀.
                 connected = sum(1 for r in results if r)
                 total = len(results)
                 print(f"Successfully connected to {connected}/{total} MCP servers")
+            
+            # Setup additional commands
+            await self.setup_additional_commands()
             
             await self.bot.start(DISCORD_TOKEN)
             
