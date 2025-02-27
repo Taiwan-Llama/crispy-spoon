@@ -1,112 +1,126 @@
 import asyncio
 import os
 from contextlib import AsyncExitStack
-from typing import Dict, List, Tuple
 from datetime import datetime
 import discord
 from discord import app_commands
 from discord.ext import commands
 import ujson as json
 from dotenv import load_dotenv
+import aiosqlite
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import get_default_environment, stdio_client
-import asyncio
 from openai import AsyncOpenAI
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.core import Document, VectorStoreIndex, Settings
 import chromadb
-from chromadb.config import Settings
-
+from chromadb.config import Settings as ChromaSettings
 
 load_dotenv()
-
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 if not DISCORD_TOKEN:
-    raise ValueError("Please set DISCORD_TOKEN in .env file")
+    raise ValueError("請在 .env 檔中設定 DISCORD_TOKEN")
 
-class DocumentManager:
-    def __init__(self, embedding_model="miscii-14b-0218_q8:latest", base_url="http://localhost:11434"):
-        self.embedding_model = OllamaEmbedding(
-            model_name=embedding_model,
-            base_url=base_url,
-            ollama_additional_kwargs={"mirostat": 0}
+# 讓客戶可透過環境變數設定嵌入模型名稱
+EMBEDDING_MODEL_NAME = os.getenv('EMBEDDING_MODEL_NAME', 'miscii-14b-0218_q8:latest')
+
+###########################################################################
+# 1. 對話記錄模組：使用 aiosqlite 持久化存儲，匯出時轉成 JSON 格式
+###########################################################################
+class ConversationLogger:
+    """
+    對話記錄將存入 SQLite 資料庫（.db 格式），
+    只有使用 /save 指令時才會匯出成 JSON 檔案。
+    """
+    def __init__(self, db_path="conversations.db"):
+        self.db_path = db_path
+        self.db = None
+
+    async def init(self):
+        self.db = await aiosqlite.connect(self.db_path)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                username TEXT NOT NULL,
+                turn_number INTEGER NOT NULL
+            )
+        """)
+        await self.db.commit()
+
+    async def add_message(self, user_id: str, role: str, content: str, username: str = None):
+        username = username if username else user_id
+        async with self.db.execute("SELECT MAX(turn_number) FROM messages WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            max_turn = row[0] if row[0] is not None else 0
+            turn_number = max_turn + 1
+        timestamp = datetime.now().isoformat()
+        await self.db.execute(
+            "INSERT INTO messages (user_id, role, content, timestamp, username, turn_number) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, role, content, timestamp, username, turn_number)
         )
-        self.document_store = {}  # Maps document_id to (content, embedding)
-        self.index = None
-        
-    async def process_file(self, file_content: str, file_name: str) -> str:
-        """Process a new file and add it to the document store"""
-        try:
-            # Create document embedding
-            embedding = self.embedding_model.get_text_embedding(file_content)
-            
-            # Store document with its embedding
-            doc_id = f"{file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.document_store[doc_id] = (file_content, embedding)
-            
-            # Update the vector store index
-            documents = [Document(text=content, id_=id_) 
-                       for id_, (content, _) in self.document_store.items()]
-            
-            Settings.embed_model = self.embedding_model
-            self.index = VectorStoreIndex.from_documents(documents)
-            
-            return f"Successfully processed and indexed file: {file_name}"
-        except Exception as e:
-            return f"Error processing file: {str(e)}"
-    
-    async def query_documents(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Query the document store and return relevant results"""
-        try:
-            if not self.index:
-                return []
-            
-            # 生成向量
-            query_embedding = self.embedding_model.get_query_embedding(query)
-        
-            # 使用嵌入进行相似性搜索
-            retriever = self.index.as_retriever(similarity_top_k=top_k)
-            results = retriever.retrieve(query_embedding=query_embedding)  # 关键修复
-        
-            return [(node.text, node.score) for node in results]
-        except Exception as e:
-            print(f"Error querying documents: {str(e)}")
-        return []
+        await self.db.commit()
 
+    async def get_all_messages(self, user_id: str):
+        async with self.db.execute(
+            "SELECT role, content, timestamp, username, turn_number FROM messages WHERE user_id = ? ORDER BY turn_number ASC",
+            (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        messages = []
+        for row in rows:
+            role, content, timestamp, username, turn_number = row
+            messages.append({
+                "role": role,
+                "content": content,
+                "timestamp": timestamp,
+                "username": username,
+                "turn_number": turn_number
+            })
+        return messages
+
+    async def clear_conversation(self, user_id: str):
+        await self.db.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+
+    async def close(self):
+        if self.db:
+            await self.db.close()
+
+###########################################################################
+# 2. 長期記憶向量檢索：ChromaDB 用以保存記憶與語意搜尋
+###########################################################################
 class OllamaEmbeddingFunction:
     def __init__(self, embedding_model: OllamaEmbedding):
         self.embedding_model = embedding_model
 
-    def __call__(self, input: List[str]) -> List[List[float]]:
-        """
-        ChromaDB expects this specific interface:
-        - Input: List of strings to embed
-        - Output: List of embedding vectors (List[List[float]])
-        """
-        return [
-            self.embedding_model.get_text_embedding(text)
-            for text in input
-        ]
+    # 修改參數名稱為 input 符合新版要求
+    def __call__(self, input: list) -> list:
+        return [self.embedding_model.get_text_embedding(text) for text in input]
 
 class ChromaMemoryManager:
     def __init__(self, embedding_model: OllamaEmbedding, collection_name="conversation_memories"):
+        # 初始化 ChromaDB 持久化客戶端
         self.client = chromadb.PersistentClient(path="./chroma_db")
         self.embedding_model = embedding_model
-        embedding_function = OllamaEmbeddingFunction(embedding_model)
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            embedding_function=embedding_function
+            embedding_function=OllamaEmbeddingFunction(embedding_model)
         )
 
     async def store_memory(self, user_id: str, content: str, metadata: dict):
         try:
+            # 查詢現有記憶以計算 turn_number
             existing = self.collection.get(
                 where={"user_id": str(user_id)},
                 include=["metadatas"]
             )
             max_turn = -1
             for meta in existing.get('metadatas', []):
-                # 如果是巢狀結構，平坦化處理
                 if isinstance(meta, list):
                     for m in meta:
                         try:
@@ -127,11 +141,9 @@ class ChromaMemoryManager:
                 "user_id": str(user_id),
                 "role": metadata.get("role", ""),
                 "timestamp": current_time.isoformat(),
-                "date": current_time.date().isoformat(),
                 "turn_number": str(turn_number),
                 "username": str(metadata.get("username") or user_id),
             }
-            
             self.collection.add(
                 documents=[content],
                 metadatas=[cleaned_metadata],
@@ -139,574 +151,436 @@ class ChromaMemoryManager:
             )
             return True
         except Exception as e:
-            print(f"Error storing memory: {str(e)}")
+            print(f"存儲記憶失敗：{str(e)}")
             return False
 
-    async def retrieve_all_memories(self, user_id: str) -> List[Tuple[str, float, dict]]:
-        """
-        直接取出該用戶所有對話記憶，並依 turn_number 排序。
-        這裡先將可能的巢狀清單平坦化，再組合成完整記憶。
-        """
+    async def retrieve_memories(self, query: str, user_id: str = None, top_k: int = 5):
         try:
-            where = {"user_id": str(user_id)}
-            all_data = self.collection.get(where=where, include=["metadatas", "documents"])
-            memories = []
-            if all_data and "documents" in all_data and all_data["documents"]:
-                docs = []
-                metas = []
-                # 平坦化 documents 與 metadatas
-                for item in all_data["documents"]:
-                    if isinstance(item, list):
-                        docs.extend(item)
-                    else:
-                        docs.append(item)
-                for item in all_data["metadatas"]:
-                    if isinstance(item, list):
-                        metas.extend(item)
-                    else:
-                        metas.append(item)
-                for doc, meta in zip(docs, metas):
-                    memories.append((doc, 0.0, meta))
-                memories.sort(key=lambda x: int(x[2].get("turn_number", 0)))
-            return memories
-        except Exception as e:
-            print(f"Error retrieving all memories: {str(e)}")
-            return []
-
-    async def retrieve_memories(self, query: str, user_id: str = None, top_k: int = 5) -> List[Tuple[str, float, dict]]:
-        try:
-            where = {"user_id": user_id} if user_id else None
-            
-            # 取得該用戶目前存有的記憶筆數
-            count = self.collection.count(where=where)
-            print(f"User {user_id} has {count} stored memories")
-            if count < top_k:
-                top_k = count
-
+            where = {"user_id": str(user_id)} if user_id else None
+            # 直接使用 query，不再呼叫 count() 避免錯誤
             results = self.collection.query(
                 query_texts=[query],
                 n_results=top_k,
                 where=where,
                 include=["metadatas", "documents", "distances"]
             )
-            
             if not results['documents'] or not results['documents'][0]:
                 return []
-                
             memories = []
-            for doc, meta, dist in zip(
-                results['documents'][0],
-                results['metadatas'][0],
-                results['distances'][0]
-            ):
+            for doc, meta, dist in zip(results['documents'][0], results['metadatas'][0], results['distances'][0]):
                 memories.append((doc, dist, meta))
-            
-            # 依照 turn_number 進行排序
             memories.sort(key=lambda x: int(x[2].get('turn_number', 0)))
             return memories
-            
         except Exception as e:
-            print(f"Error retrieving memories: {str(e)}")
+            print(f"檢索記憶失敗：{str(e)}")
             return []
 
-class ConversationLogger:
-    def __init__(self, save_dir="conversations"):
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-        self.conversations: Dict[str, List[Dict]] = {}
-        self.memory_manager = ChromaMemoryManager(
-            embedding_model=OllamaEmbedding(
-                model_name="miscii-14b-0218_q8:latest",
-                base_url="http://localhost:11434"
-            )
+###########################################################################
+# 3. 文件索引模組（基本保持原有邏輯）
+###########################################################################
+class DocumentManager:
+    def __init__(self, embedding_model=EMBEDDING_MODEL_NAME, base_url="http://localhost:11434"):
+        self.embedding_model = OllamaEmbedding(
+            model_name=embedding_model,
+            base_url=base_url,
+            ollama_additional_kwargs={"mirostat": 0}
         )
-    
-    async def add_message(self, user_id: str, role: str, content: str, username: str = None):
-        if user_id not in self.conversations:
-            self.conversations[user_id] = []
-        # 若 username 為 None，則預設使用 user_id
-        username = username if username is not None else user_id
-        
-        message_data = {
-            "from": role,
-            "value": content,
-            "timestamp": datetime.now().isoformat(),
-            "username": username
-        }
-        self.conversations[user_id].append(message_data)
-        
-        metadata = {
-            "user_id": user_id,
-            "role": role,
-            "username": username,
-            "timestamp": datetime.now().isoformat()
-        }
-        await self.memory_manager.store_memory(user_id, content, metadata)
+        self.document_store = {}  # {doc_id: (content, embedding)}
+        self.index = None
 
-    def save_conversation(self, user_id: str):
-        if user_id not in self.conversations:
-            return
-            
-        filename = f"{self.save_dir}/conversation_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        data = {
-            "conversations": [{
-                "messages": self.conversations[user_id]
-            }]
-        }
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
-        self.conversations[user_id] = []
+    async def process_file(self, file_content: str, file_name: str) -> str:
+        try:
+            embedding = self.embedding_model.get_text_embedding(file_content)
+            doc_id = f"{file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.document_store[doc_id] = (file_content, embedding)
+            documents = [Document(text=content, id_=doc_id)
+                         for doc_id, (content, _) in self.document_store.items()]
+            Settings.embed_model = self.embedding_model
+            self.index = VectorStoreIndex.from_documents(documents)
+            return f"成功處理並索引檔案：{file_name}"
+        except Exception as e:
+            return f"處理檔案時出錯：{str(e)}"
 
+    async def query_documents(self, query: str, top_k: int = 3):
+        try:
+            if not self.index:
+                return []
+            query_embedding = self.embedding_model.get_query_embedding(query)
+            retriever = self.index.as_retriever(similarity_top_k=top_k)
+            results = retriever.retrieve(query_embedding=query_embedding)
+            return [(node.text, node.score) for node in results]
+        except Exception as e:
+            print(f"查詢文件出錯：{str(e)}")
+            return []
+
+###########################################################################
+# 4. MCP 客戶端與 Discord Bot 整合
+###########################################################################
 class MCPClient:
     def __init__(self):
-        # Initialize existing components
-        self.sessions: Dict[str, ClientSession] = {}
+        self.sessions = {}
         self.exit_stack = AsyncExitStack()
         self.openai = AsyncOpenAI(api_key="sk-tmp", base_url="http://localhost:11434/v1")
-        self.logger = ConversationLogger()
-        self.doc_manager = DocumentManager()
-        
-        # Add message context tracking
+        self.logger = ConversationLogger()  # 使用 SQLite 存儲對話
+        self.doc_manager = DocumentManager()  # 嵌入模型名稱從環境變數取得
+        self.chroma_memory_manager = ChromaMemoryManager(
+            embedding_model=OllamaEmbedding(model_name=EMBEDDING_MODEL_NAME, base_url="http://localhost:11434")
+        )
         self.current_message = None
-        
-        # Initialize Discord bot with all intents
+
         intents = discord.Intents.default()
         intents.message_content = True
         intents.messages = True
         self.bot = commands.Bot(command_prefix="!", intents=intents)
-        
-        # Define MCP servers configuration
+
         self.mcp_servers = {
-        "puppeteer": {
-            "command": "C:/Program Files/nodejs/npx.cmd",
-            "args": [
-                "-y",
-                "@modelcontextprotocol/server-puppeteer"
-            ]
-        },
-        "duckduckgo-search-server": {
-            "command": "node",
-            "args": [
-            "C:/Users/jmes1/Documents/Cline/MCP/duckduckgo-search-server/build/index.js"
-            ],
-            "alwaysAllow": []
-        },
-        "sequential-thinking": {
-            "command": "C:/Program Files/nodejs/npx.cmd",
-            "args": [
-                "-y",
-                "@modelcontextprotocol/server-sequential-thinking"
-                    ]
+            "puppeteer": {
+                "command": "C:/Program Files/nodejs/npx.cmd",
+                "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+            },
+            "duckduckgo-search-server": {
+                "command": "node",
+                "args": ["C:/Users/jmes1/Documents/Cline/MCP/duckduckgo-search-server/build/index.js"],
+                "alwaysAllow": []
+            },
+            "sequential-thinking": {
+                "command": "C:/Program Files/nodejs/npx.cmd",
+                "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
             }
         }
-        
-        # Register commands and events
         self.register_commands()
         self.register_events()
 
     def register_commands(self):
-        @self.bot.tree.command(name="save", description="Save the current conversation history")
+        @self.bot.tree.command(name="save", description="匯出當前對話記錄（JSON 格式）")
         async def save_chat(interaction: discord.Interaction):
-            """Save the current conversation history"""
             try:
-                self.logger.save_conversation(str(interaction.user.id))
-                await interaction.response.send_message("Conversation saved successfully!")
+                messages = await self.logger.get_all_messages(str(interaction.user.id))
+                if not messages:
+                    await interaction.response.send_message("未找到對話記錄。")
+                    return
+                filename = f"conversation_{interaction.user.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(messages, f, ensure_ascii=False, indent=2)
+                await interaction.response.send_message(f"對話已匯出至 {filename}！")
             except Exception as e:
-                await interaction.response.send_message(f"Failed to save conversation: {str(e)}")
+                await interaction.response.send_message(f"匯出對話失敗：{str(e)}")
 
-        @self.bot.tree.command(name="query", description="Query the document store for relevant information")
-        @app_commands.describe(query="The search query to find relevant documents")
+        @self.bot.tree.command(name="query", description="根據關鍵字搜尋相關文件")
+        @app_commands.describe(query="搜尋查詢內容")
         async def query_docs(interaction: discord.Interaction, query: str):
-            """Query the document store for relevant information"""
             await interaction.response.defer()
             results = await self.doc_manager.query_documents(query)
             if not results:
-                await interaction.followup.send("No relevant documents found.")
+                await interaction.followup.send("未找到相關文件。")
                 return
-                
-            response = "Found relevant information:\n\n"
+            response = "找到以下相關文件：\n\n"
             for text, score in results:
-                response += f"Relevance score: {score:.2f}\n```\n{text[:500]}...\n```\n"
-            
+                response += f"相似度：{score:.2f}\n```\n{text[:500]}...\n```\n"
             await interaction.followup.send(response)
 
-        @self.bot.tree.command(name="servers", description="List all available MCP servers and their status")
+        @self.bot.tree.command(name="servers", description="列出 MCP 服務器及其狀態")
         async def list_servers(interaction: discord.Interaction):
-            """List all available MCP servers and their status"""
             await interaction.response.defer()
             status = []
             for server_name, session in self.sessions.items():
                 tools = []
                 if session:
                     try:
-                        response = await session.list_tools()
-                        tools = [tool.name for tool in response.tools]
-                    except:
-                        tools = ["Error fetching tools"]
-                status.append(f"- {server_name}: {'Connected' if session else 'Disconnected'}\n  Tools: {', '.join(tools)}")
-            
-            status_message = "MCP Servers Status:\n" + "\n".join(status)
-            await interaction.followup.send(status_message)
+                        resp = await session.list_tools()
+                        tools = [tool.name for tool in resp.tools]
+                    except Exception:
+                        tools = ["獲取工具資訊失敗"]
+                status.append(f"- {server_name}: {'已連接' if session else '未連接'}\n  工具：{', '.join(tools)}")
+            await interaction.followup.send("MCP 服務器狀態：\n" + "\n".join(status))
 
     def register_events(self):
         @self.bot.event
         async def on_ready():
-            print(f"\n{self.bot.user} has connected to Discord!")
-            print(f"Bot is in {len(self.bot.guilds)} guilds:")
+            print(f"{self.bot.user} 已成功連線 Discord！")
             for guild in self.bot.guilds:
-                print(f"- {guild.name} (id: {guild.id})")
-            
-            # Sync commands with Discord
+                print(f"- {guild.name} (ID: {guild.id})")
             try:
                 synced = await self.bot.tree.sync()
-                print(f"Synced {len(synced)} command(s)")
+                print(f"已同步 {len(synced)} 個指令")
             except Exception as e:
-                print(f"Failed to sync commands: {e}")
-                
-            permissions = discord.Permissions(
-                send_messages=True,
-                read_messages=True,
-                read_message_history=True,
-                manage_messages=True
-            )
-            invite_link = discord.utils.oauth_url(
-                self.bot.user.id,
-                permissions=permissions
-            )
-            print(f"\nInvite link: {invite_link}")
+                print(f"指令同步失敗：{str(e)}")
+            perms = discord.Permissions(send_messages=True, read_messages=True, read_message_history=True, manage_messages=True)
+            invite_link = discord.utils.oauth_url(self.bot.user.id, permissions=perms)
+            print(f"邀請連結：{invite_link}")
 
         @self.bot.event
         async def on_message(message):
             if message.author == self.bot.user:
                 return
-
             try:
-                # Store current message context
                 self.current_message = message
 
-                # Handle file attachments
+                # 處理附件檔案 (.txt, .py, .md, .json)
                 if message.attachments:
                     for attachment in message.attachments:
                         if attachment.filename.endswith(('.txt', '.py', '.md', '.json')):
                             file_content = (await attachment.read()).decode('utf-8')
                             result = await self.doc_manager.process_file(file_content, attachment.filename)
                             await message.channel.send(result)
-                
-                # Process commands if message starts with prefix
+
                 if message.content.startswith(self.bot.command_prefix):
                     await self.bot.process_commands(message)
                     return
-                    
-                # Skip messages that look like slash commands
                 if message.content.startswith('/'):
                     return
 
                 async with message.channel.typing():
-                    # 取得相關文件內容
-                    doc_results = await self.doc_manager.query_documents(message.content)
-                    context = "\n".join([f"Related content:\n{text}" for text, _ in doc_results])
-                    user_display_name = message.author.display_name
+                    user_id = str(message.author.id)
+                    user_display = message.author.display_name
                     user_mention = message.author.mention
-            
-                    # 記錄使用者訊息 (await 改為同步等待)
-                    await self.logger.add_message(
-                        str(message.author.id),
-                        "human",
-                        message.content,
-                        message.author.display_name
-                                )
 
-            
-                    enhanced_query = f"{message.content}\n\nContext from related documents:\n{context}" if context else message.content
-            
-                    response = await self.process_query_all_servers(
-                        enhanced_query,
-                        user_display_name,
-                        user_mention
-                    )
-            
-                # 記錄助理回應
-                    await self.logger.add_message(
-                        str(message.author.id),
-                        "assistant",
-                        response
-                    )
-                    
-                    # Send response in chunks if needed
+                    # 記錄使用者訊息到 SQLite
+                    await self.logger.add_message(user_id, "human", message.content, user_display)
+                    # 同步記錄到 ChromaDB（建立向量記憶）
+                    metadata = {"role": "human", "username": user_display}
+                    await self.chroma_memory_manager.store_memory(user_id, message.content, metadata)
+
+                    # 取得文件輔助內容
+                    doc_results = await self.doc_manager.query_documents(message.content)
+                    doc_context = "\n".join([f"文件內容：\n{text}" for text, _ in doc_results])
+
+                    # 取得 SQLite 中的完整對話記錄
+                    sqlite_msgs = await self.logger.get_all_messages(user_id)
+                    sqlite_context = "\n".join([f"{msg['username']}({msg['role']}): {msg['content']}" for msg in sqlite_msgs])
+
+                    # 從 ChromaDB 檢索相關記憶（語意檢索）
+                    vector_memories = await self.chroma_memory_manager.retrieve_memories(message.content, user_id)
+                    vector_context = "\n".join([f"記憶輪次 {meta.get('turn_number')}, {meta.get('timestamp')}: {doc[:200]}"
+                                                for doc, dist, meta in vector_memories])
+
+                    # 組合上下文：完整對話 + 向量記憶 + 文件輔助
+                    memory_context = f"完整對話記錄：\n{sqlite_context}\n\n相關記憶：\n{vector_context}\n\n文件輔助：\n{doc_context}"
+
+                    # 增強查詢內容
+                    enhanced_query = f"{message.content}\n\n【記憶上下文】\n{memory_context}"
+                    response = await self.process_query_all_servers(enhanced_query, user_display, user_mention)
+
+                    # 記錄回應到 SQLite 與 ChromaDB
+                    await self.logger.add_message(user_id, "assistant", response)
+                    metadata = {"role": "assistant", "username": user_display}
+                    await self.chroma_memory_manager.store_memory(user_id, response, metadata)
+
+                    # 分段傳送回應（若超長則切割）
                     if len(response) > 2000:
-                        chunks = [response[i:i+1999] for i in range(0, len(response), 1999)]
-                        for chunk in chunks:
-                            await message.channel.send(chunk)
+                        for i in range(0, len(response), 1999):
+                            await message.channel.send(response[i:i+1999])
                     else:
                         await message.channel.send(response)
             except Exception as e:
-                error_msg = f"Error processing message: {str(e)}"
-                print(error_msg)
-                await message.channel.send(error_msg)
+                err = f"訊息處理錯誤：{str(e)}"
+                print(err)
+                await message.channel.send(err)
             finally:
-                # Clear message context after processing
                 self.current_message = None
 
-    # 修改消息處理邏輯
-    async def process_query_all_servers(self, query: str, user_display_name: str, user_mention: str) -> str:
-        # 取得完整對話記憶（所有輪次）
+    async def process_query_all_servers(self, query: str, user_display: str, user_mention: str) -> str:
         user_id = str(self.current_message.author.id) if self.current_message else None
-        memory_results = await self.logger.memory_manager.retrieve_all_memories(user_id)
-        memory_context = "\n".join([
-            f"- 歷史對話 [輪次: {meta.get('turn_number', '?')}, 時間: {meta.get('timestamp', '?')}]：{text[:100]}..." 
-            for text, _, meta in memory_results
-        ])
 
-        messages = [
+        messages_for_api = [
             {
                 "role": "system",
                 "content": f"""
 <|context_start|>personas<|context_sep|>
 <|personas_start|>user<|persona_sep|>
-I am {user_display_name}. 你可以用 {user_mention} 來@我.
-我是 Nalolo 的設計者. 我喜歡人工智慧, 也喜歡和 Nalolo 聊日常. 我希望 Nalolo 能像真人那樣表達自己.
+我是 {user_display}，你可以用 {user_mention} 來@我。
+我是 Nalolo 的設計者，請以真實人類方式回應。
 <|personas_end|>
 <|personas_start|>assistant<|persona_sep|>
-I am Nalolo. 我有自己的主見和三觀.
-當使用者分享重要資訊或表達感謝,我會使用{user_mention}來@使用者。
-我也會在以下情況@用戶:
-1. 用戶分享了個人成就或好消息
-2. 用戶需要特別注意某個重要訊息
-3. 回應用戶的感謝或稱讚
-4. 討論較為嚴肅或重要的話題
-其他普通對話中,我會直接用{user_display_name}稱呼使用者.
+我是 Nalolo，具有獨立主見與三觀。
+當用戶分享重要訊息時，我會用 {user_mention} 標記。
 <|personas_end|>
 <|Tool_start|>Tool<|Tool_sep|>
 **Tool Instructions (Separated for Combination):**
-...
+
+
+   * **puppeteer:**
+   - Instruction: "When the user asks a question that requires browsing the web or interacting with a website to find an answer, use the `puppeteer` tool to access and retrieve information from the web.  For example, if the user asks about current events, product information, or needs data from a specific website, use `puppeteer` to browse and get the relevant content. Ensure to clearly state when you are using `puppeteer` to get information."
+
+
+   * **duckduckgo-search-server:**
+   - Instruction: "If the user's query requires general knowledge or information retrieval from the internet, and `puppeteer` is not specifically needed for website interaction, use the `duckduckgo-search-server` tool to perform a web search. This is useful for answering factual questions, getting definitions, or finding general information.  Summarize the search results concisely and inform the user that you used `duckduckgo-search-server` for the information."
+
+   * **sequential-thinking:**
+   - Instruction: "Employ `sequential-thinking` to break down complex user requests or questions into smaller, manageable steps. Plan your responses logically, especially for multi-turn conversations or when addressing multifaceted queries.  Think step-by-step to ensure a coherent and well-structured interaction. For example, if a user asks for help with a multi-stage task, use sequential thinking to address each stage systematically."
+
 <|Tool_end|>
 <|memory_start|>
-{memory_context}
+{query}
 <|memory_end|>
 <|context_end|>
 """
             },
-            {
-                "role": "user",
-                "content": query
-            }
-            ]
+            {"role": "user", "content": query}
+        ]
 
-            # Get tools from all servers
+        # 收集 MCP 服務工具資訊（若有）
         all_tools = []
         for server_name, session in self.sessions.items():
-                try:
-                    response = await session.list_tools()
-                    server_tools = response.tools
-                    for tool in server_tools:
-                        tool_dict = {
-                            "type": "function",
-                            "function": {
-                                "name": f"{server_name}:{tool.name}",
-                                "description": tool.description,
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": tool.inputSchema["properties"],
-                                    "required": tool.inputSchema.get("required", []),
-                                },
+            try:
+                resp = await session.list_tools()
+                for tool in resp.tools:
+                    tool_dict = {
+                        "type": "function",
+                        "function": {
+                            "name": f"{server_name}:{tool.name}",
+                            "description": tool.description,
+                            "parameters": {
+                                "type": "object",
+                                "properties": tool.inputSchema["properties"],
+                                "required": tool.inputSchema.get("required", []),
                             },
-                        }
-                        all_tools.append(tool_dict)
-                except Exception as e:
-                    print(f"Error fetching tools from {server_name}: {str(e)}")
+                        },
+                    }
+                    all_tools.append(tool_dict)
+            except Exception as e:
+                print(f"{server_name} 服務工具取得錯誤：{str(e)}")
 
         try:
-            # 呼叫 openai API 的邏輯...
             completion = await self.openai.chat.completions.create(
                 model="miscii-14b-0218_q8:latest",
-                messages=messages,
+                messages=messages_for_api,
                 temperature=0,
                 top_p=1,
                 max_tokens=8196,
                 extra_body=dict(repetition_penalty=1.05, top_k=-1, num_beams=100)
             )
-            completion = completion.choices[0].message
-
-            final_text = []
-            if completion.content:
-                final_text.append(completion.content)
-
-            if completion.tool_calls:
-                for tool_call in completion.tool_calls:
-                    tool_parts = tool_call.function.name.split(":", 1)
-                    if len(tool_parts) != 2:
+            comp = completion.choices[0].message
+            final_text = comp.content if comp.content else ""
+            if comp.tool_calls:
+                for tool_call in comp.tool_calls:
+                    parts = tool_call.function.name.split(":", 1)
+                    if len(parts) != 2:
                         continue
-                    server_name, tool_name = tool_parts
+                    srv_name, tool_name = parts
                     tool_args = json.loads(tool_call.function.arguments)
-                    if server_name in self.sessions:
-                        session = self.sessions[server_name]
-                        result = await session.call_tool(tool_name, tool_args)
-                        final_text.append(f"[Using {server_name} tool {tool_name}]")
-                        messages.extend([
-                            {"role": "assistant", "content": completion.content} if completion.content else None,
-                            {"role": "tool", "name": f"{server_name}:{tool_name}", "content": result.content}
-                        ])
-                final_response = await self.openai.chat.completions.create(
-                    model="miscii-14b-0218_q8:latest",
-                    messages=[msg for msg in messages if msg],
-                    temperature=0,
-                    top_p=1,
-                    max_tokens=8196,
-                    extra_body=dict(repetition_penalty=1.05, top_k=-1, num_beams=100)
-                )
-                final_text.append(final_response.choices[0].message.content)
-
-            return "\n".join(filter(None, final_text))
+                    if srv_name in self.sessions:
+                        session = self.sessions[srv_name]
+                        res = await session.call_tool(tool_name, tool_args)
+                        final_text += f"\n[使用 {srv_name} 的工具 {tool_name} 回應：{res.content}]"
+            return final_text
         except Exception as e:
-            return f"Error processing query: {str(e)}"
+            return f"處理查詢錯誤：{str(e)}"
 
-    # Add new slash commands for common functions
     async def setup_additional_commands(self):
-        # Command group for document management
-        doc_group = app_commands.Group(name="doc", description="Document management commands")
-        
-        @doc_group.command(name="list", description="List all stored documents")
+        # 文件管理群組
+        doc_group = app_commands.Group(name="doc", description="文件管理相關指令")
+        @doc_group.command(name="list", description="列出所有已索引文件")
         async def doc_list(interaction: discord.Interaction):
             if not self.doc_manager.document_store:
-                await interaction.response.send_message("No documents have been indexed yet.")
+                await interaction.response.send_message("尚未索引任何文件。")
                 return
-                
             docs = "\n".join([f"- {doc_id}" for doc_id in self.doc_manager.document_store.keys()])
-            await interaction.response.send_message(f"Indexed documents:\n{docs}")
-        
-        @doc_group.command(name="clear", description="Clear all stored documents")
+            await interaction.response.send_message("已索引文件：\n" + docs)
+        @doc_group.command(name="clear", description="清除所有已索引文件")
         async def doc_clear(interaction: discord.Interaction):
             self.doc_manager.document_store = {}
             self.doc_manager.index = None
-            await interaction.response.send_message("Document store has been cleared.")
-            
-        # Command group for conversation management
-        conv_group = app_commands.Group(name="conv", description="Conversation management commands")
+            await interaction.response.send_message("文件索引已清空。")
         
-        @conv_group.command(name="clear", description="Clear your conversation history")
+        # 對話管理群組
+        conv_group = app_commands.Group(name="conv", description="對話管理相關指令")
+        @conv_group.command(name="clear", description="清除你的對話記錄")
         async def conv_clear(interaction: discord.Interaction):
             user_id = str(interaction.user.id)
-            if user_id in self.logger.conversations:
-                self.logger.conversations[user_id] = []
-                await interaction.response.send_message("Your conversation history has been cleared.")
-            else:
-                await interaction.response.send_message("No conversation history found.")
+            await self.logger.clear_conversation(user_id)
+            await interaction.response.send_message("你的對話記錄已清除。")
         
-        # Add the command groups to the bot
         self.bot.tree.add_command(doc_group)
         self.bot.tree.add_command(conv_group)
         
-        # Individual utility commands
-        @self.bot.tree.command(name="help", description="Display information about available commands")
+        @self.bot.tree.command(name="help", description="顯示所有可用指令資訊")
         async def help_command(interaction: discord.Interaction):
             help_text = """
-**Available Commands**
+**可用指令**
 
-**/save** - Save the current conversation history
-**/query [text]** - Search documents for information
-**/servers** - Show MCP server status and available tools
+**/save** - 將當前對話記錄匯出為 JSON 格式
+**/query [內容]** - 根據內容搜尋文件
+**/servers** - 顯示 MCP 服務器狀態與工具列表
 
-**Document Management**
-**/doc list** - List all indexed documents
-**/doc clear** - Clear all document storage
+**文件管理**
+**/doc list** - 列出所有已索引文件
+**/doc clear** - 清空文件索引
 
-**Conversation Management**
-**/conv clear** - Clear your conversation history
+**對話管理**
+**/conv clear** - 清除你的對話記錄
 
-**Other**
-You can also upload files (.txt, .py, .md, .json) to have them indexed
-and talk directly to the bot without any commands
+其他：你也可上傳 .txt, .py, .md, .json 檔案進行文件索引，並直接與機器人對話。
             """
             await interaction.response.send_message(help_text)
 
     async def connect_to_server(self, server_name: str) -> bool:
-        """Connect to a specific MCP server with retry logic"""
         max_retries = 3
-        retry_delay = 5  # seconds
-        
+        retry_delay = 5
         for attempt in range(max_retries):
             try:
                 if server_name not in self.mcp_servers:
-                    print(f"Unknown server: {server_name}")
+                    print(f"未知服務器：{server_name}")
                     return False
-
-                server_config = self.mcp_servers[server_name]
+                srv_conf = self.mcp_servers[server_name]
                 env = get_default_environment()
-
-                server_params = StdioServerParameters(
-                    command=server_config["command"],
-                    args=server_config["args"],
-                    env=env,
+                params = StdioServerParameters(
+                    command=srv_conf["command"],
+                    args=srv_conf["args"],
+                    env=env
                 )
-                
-                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(params))
                 stdio, write = stdio_transport
                 session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
-                
                 await session.initialize()
                 self.sessions[server_name] = session
-                
-                response = await session.list_tools()
-                print(f"\nConnected to {server_name} server with tools:", [tool.name for tool in response.tools])
+                resp = await session.list_tools()
+                print(f"已連接 {server_name}，工具：{[tool.name for tool in resp.tools]}")
                 return True
-                
             except Exception as e:
-                print(f"Connection attempt {attempt + 1} to {server_name} failed: {str(e)}")
+                print(f"第 {attempt+1} 次連接 {server_name} 失敗：{str(e)}")
                 if attempt < max_retries - 1:
-                    print(f"Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                 else:
-                    print(f"Max retries reached. Failed to connect to {server_name} server.")
+                    print(f"無法連接 {server_name}。")
                     return False
 
     async def start(self):
-        """Start the bot with connection handling for all servers"""
         try:
-            # Connect to all servers
-            connection_tasks = []
-            for server_name in self.mcp_servers:
-                connection_tasks.append(self.connect_to_server(server_name))
-            
-            # Wait for all connections to complete
-            results = await asyncio.gather(*connection_tasks)
-            
+            await self.logger.init()  # 初始化 SQLite 對話記錄
+            tasks = [self.connect_to_server(name) for name in self.mcp_servers]
+            results = await asyncio.gather(*tasks)
             if not any(results):
-                print("Failed to establish any MCP connections. Starting bot anyway...")
+                print("無法連接任何 MCP 服務器，但機器人仍會啟動。")
             else:
                 connected = sum(1 for r in results if r)
-                total = len(results)
-                print(f"Successfully connected to {connected}/{total} MCP servers")
-            
-            # Setup additional commands
+                print(f"已連接 {connected} / {len(results)} 個 MCP 服務器。")
             await self.setup_additional_commands()
-            
             await self.bot.start(DISCORD_TOKEN)
-            
         except Exception as e:
-            print(f"Error starting bot: {str(e)}")
+            print(f"啟動錯誤：{str(e)}")
         finally:
             await self.cleanup()
 
     async def cleanup(self):
-        """Clean up resources"""
         try:
             await self.bot.close()
             await self.exit_stack.aclose()
+            await self.logger.close()
         except Exception as e:
-            print(f"Error during cleanup: {str(e)}")
+            print(f"清理資源時發生錯誤：{str(e)}")
 
 async def main():
     client = MCPClient()
     try:
         await client.start()
     except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
+        print("正在優雅關閉……")
     except Exception as e:
-        print(f"Fatal error: {str(e)}")
+        print(f"致命錯誤：{str(e)}")
     finally:
         await client.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
